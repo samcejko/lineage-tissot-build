@@ -19,6 +19,9 @@
 name: Build LineageOS for tissot
 
 on:
+  push:
+    branches:
+      - master
   # ── Scheduled: every Sunday at 02:00 UTC (04:00 CET) ──
   schedule:
     - cron: "0 2 * * 0"
