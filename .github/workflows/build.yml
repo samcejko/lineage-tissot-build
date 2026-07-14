@@ -113,15 +113,15 @@ jobs:
         haskell: true
         large-packages: true
         docker-images: true
-        swap-storage: false
+        swap-storage: true
 
     - name: "🧹 Create swapfile"
       run: |
         echo "Creating 8GB swapfile..."
-        sudo fallocate -l 8G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
+        sudo fallocate -l 8G /swapfile2 || sudo dd if=/dev/zero of=/swapfile2 bs=1M count=8192
+        sudo chmod 600 /swapfile2
+        sudo mkswap /swapfile2
+        sudo swapon /swapfile2
         echo "Memory and swap:"
         free -h
         echo "Disk space:"
