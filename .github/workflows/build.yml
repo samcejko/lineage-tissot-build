@@ -115,16 +115,17 @@ jobs:
         docker-images: true
         swap-storage: false
 
-    - name: "🧹 Maximize build space"
-      uses: easimon/maximize-build-space@master
-      with:
-        root-reserve-mb: 512
-        swap-size-mb: 8192
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
-        remove-docker-images: 'true'
+    - name: "🧹 Create swapfile"
+      run: |
+        echo "Creating 8GB swapfile..."
+        sudo fallocate -l 8G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        echo "Memory and swap:"
+        free -h
+        echo "Disk space:"
+        df -h /
     - name: "📦 Install build dependencies"
       run: |
         sudo apt-get update -qq
