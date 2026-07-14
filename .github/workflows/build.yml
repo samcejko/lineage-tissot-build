@@ -104,10 +104,21 @@ jobs:
     # ╔═════════════════════════════════════════════╗
     # ║ 1.  Prepare the runner environment          ║
     # ╚═════════════════════════════════════════════╝
-    - name: "🧹 Maximize disk space"
+    - name: "🧹 Free disk space"
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: false
+
+    - name: "🧹 Maximize build space"
       uses: easimon/maximize-build-space@master
       with:
-        root-reserve-mb: 8192
+        root-reserve-mb: 512
         swap-size-mb: 8192
         remove-dotnet: 'true'
         remove-android: 'true'
