@@ -1,0 +1,808 @@
+# ╔═══════════════════════════════════════════════════════════════════╗
+# ║  Automated LineageOS Build — Xiaomi Mi A1 (tissot)              ║
+# ║                                                                  ║
+# ║  Vanilla LineageOS (no GApps) built with Evolution-X device     ║
+# ║  trees on standard GitHub-hosted runners.                        ║
+# ║                                                                  ║
+# ║  Features:                                                       ║
+# ║    • Smart branch detection with readiness/stability checks      ║
+# ║    • Aggressive disk cleanup + 10 GB swap                        ║
+# ║    • Persistent ccache via GitHub Actions cache                  ║
+# ║    • Multi-run continuation to bypass the 6-hour job limit       ║
+# ║    • Automatic GitHub Releases with ROM + images                 ║
+# ║                                                                  ║
+# ║  Required Secrets:                                               ║
+# ║    PAT_TOKEN — Fine-grained PAT with Actions: Read & Write      ║
+# ║               (needed for continuation re-trigger only)          ║
+# ╚═══════════════════════════════════════════════════════════════════╝
+
+name: Build LineageOS for tissot
+
+on:
+  # ── Scheduled: every Sunday at 02:00 UTC (04:00 CET) ──
+  schedule:
+    - cron: "0 2 * * 0"
+
+  # ── Manual trigger with optional overrides ──
+  workflow_dispatch:
+    inputs:
+      lineage_branch:
+        description: "Override LineageOS branch (leave empty = auto-detect)"
+        required: false
+        default: ""
+        type: string
+      evox_branch:
+        description: "Override Evolution-X branch (leave empty = auto-detect)"
+        required: false
+        default: ""
+        type: string
+      force_clean:
+        description: "Force a completely clean build (discard ccache)"
+        required: false
+        default: false
+        type: boolean
+      continuation_count:
+        description: "[Internal] Build continuation attempt counter"
+        required: false
+        default: "0"
+        type: string
+
+# ── Permissions for creating Releases ──
+permissions:
+  contents: write
+
+# ── Global configuration ──
+env:
+  DEVICE: tissot
+  BUILD_TARGET: lineage_tissot-userdebug
+  ANDROID_DIR: ${{ github.workspace }}/android
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_SIZE: "5G"
+  MAX_CONTINUATIONS: "3"
+  WATCHDOG_SECONDS: "19800"          # 5 h 30 min (max time for the ENTIRE job before stopping)
+
+  # Evolution-X device tree repositories
+  DEVICE_REPO: Evolution-X-Devices/device_xiaomi_tissot
+  DEVICE_COMMON_REPO: Evolution-X-Devices/device_xiaomi_msm8953-common
+  KERNEL_REPO: Evolution-X-Devices/kernel_xiaomi_tissot
+  VENDOR_REPO: Evolution-X-Devices/vendor_xiaomi_tissot
+  VENDOR_COMMON_REPO: Evolution-X-Devices/vendor_xiaomi_msm8953-common
+
+jobs:
+  build:
+    name: "LineageOS tissot (run ${{ github.event.inputs.continuation_count || '0' }}/${{ vars.MAX_CONTINUATIONS || '3' }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350              # hard cap just under 6 h
+
+    steps:
+    # ╔═════════════════════════════════════════════╗
+    # ║ 0.  Pre-flight checks                      ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "📋 Checkout repo (for release tagging)"
+      uses: actions/checkout@v4
+
+    - name: "⏱️ Record job start time"
+      run: echo "JOB_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
+
+    - name: "🔢 Validate continuation count"
+      id: continuation
+      run: |
+        COUNT="${{ github.event.inputs.continuation_count || '0' }}"
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "📊 Continuation attempt: $COUNT / $MAX_CONTINUATIONS"
+
+        if [ "$COUNT" -ge "$MAX_CONTINUATIONS" ]; then
+          echo "::error::Maximum continuation attempts ($MAX_CONTINUATIONS) reached."
+          echo "The build could not complete within the allotted time."
+          echo "Consider using a self-hosted runner with more CPU/RAM."
+          exit 1
+        fi
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 1.  Prepare the runner environment          ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "🧹 Maximize disk space"
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        swap-size-mb: 8192
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-docker-images: 'true'
+    - name: "📦 Install build dependencies"
+      run: |
+        sudo apt-get update -qq
+
+        sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ccache curl flex \
+          g++-multilib gcc-multilib git git-lfs gnupg gperf \
+          imagemagick lib32readline-dev lib32z1-dev \
+          libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+          libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+          lzop pngcrush rsync schedtool squashfs-tools \
+          xsltproc zip zlib1g-dev python3 python-is-python3 \
+          fontconfig wget                                        \
+          2>/dev/null || true
+
+        echo "✅ Build dependencies installed"
+
+    - name: "🔧 Install repo tool"
+      run: |
+        mkdir -p ~/bin
+        curl -sL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> "$GITHUB_PATH"
+
+        git config --global user.name  "LineageOS Builder"
+        git config --global user.email "builder@localhost"
+        git config --global color.ui   false
+
+        echo "✅ repo tool ready"
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 2.  Smart branch detection                  ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "🔍 Detect best available branch"
+      id: detect
+      run: |
+        set -euo pipefail
+
+        # ── If the user (or continuation) supplied both branches, skip detection ──
+        INPUT_LOS="${{ github.event.inputs.lineage_branch }}"
+        INPUT_EVOX="${{ github.event.inputs.evox_branch }}"
+
+        if [ -n "$INPUT_LOS" ] && [ -n "$INPUT_EVOX" ]; then
+          echo "📌 Using explicitly specified branches:"
+          echo "   LineageOS : $INPUT_LOS"
+          echo "   EvoX      : $INPUT_EVOX"
+          echo "los_branch=$INPUT_LOS"   >> "$GITHUB_OUTPUT"
+          echo "evox_branch=$INPUT_EVOX" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Candidate mapping: newest first ──
+        # Format — evox_codename:lineage_branch
+        CANDIDATES=(
+          "cnb:lineage-24.0"
+          "bka:lineage-23.0"
+        )
+
+        # Helper: check whether a GitHub repo/branch exists (HTTP 200)
+        branch_exists() {
+          local repo="$1" branch="$2"
+          local code
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+                   "https://api.github.com/repos/${repo}/branches/${branch}")
+          [ "$code" = "200" ]
+        }
+
+        check_candidate() {
+          local los="$1" evox="$2"
+
+          echo ""
+          echo "━━━  Evaluating: $los  ↔  $evox  ━━━"
+
+          # 1) LineageOS manifest branch must exist
+          if ! branch_exists "LineageOS/android" "$los"; then
+            echo "  ❌ LineageOS/android — branch '$los' not found"; return 1
+          fi
+          echo "  ✅ LineageOS manifest branch exists"
+
+          # 2) Critical sub-repos must carry the branch
+          for sub in android_build android_vendor_lineage android_frameworks_base; do
+            if ! branch_exists "LineageOS/$sub" "$los"; then
+              echo "  ❌ LineageOS/$sub — missing branch '$los'"; return 1
+            fi
+          done
+          echo "  ✅ Key LineageOS sub-repos present"
+
+          # 3) Branch must be actively maintained (≤ 120 days since last commit)
+          local commit_date days
+          commit_date=$(curl -s \
+            "https://api.github.com/repos/LineageOS/android/branches/$los" \
+            | python3 -c "
+          import sys, json
+          try:
+              print(json.load(sys.stdin)['commit']['commit']['committer']['date'])
+          except Exception:
+              print('')" 2>/dev/null)
+
+          if [ -n "$commit_date" ]; then
+            days=$(( ( $(date +%s) - $(date -d "$commit_date" +%s) ) / 86400 ))
+            if [ "$days" -gt 120 ]; then
+              echo "  ⚠️  Branch stale ($days days since last commit)"; return 1
+            fi
+            echo "  ✅ Branch active ($days days ago)"
+          fi
+
+          # 4) All Evolution-X device repos must have the target branch
+          for repo in "$DEVICE_REPO" "$DEVICE_COMMON_REPO" \
+                      "$KERNEL_REPO" "$VENDOR_REPO" "$VENDOR_COMMON_REPO"; do
+            if ! branch_exists "$repo" "$evox"; then
+              echo "  ❌ $repo — missing branch '$evox'"; return 1
+            fi
+          done
+          echo "  ✅ All Evolution-X repos have branch '$evox'"
+
+          # 5) Trial repo init (ensures manifest XML is parseable)
+          echo "  🔄 Trial repo init …"
+          local trial
+          trial=$(mktemp -d)
+          pushd "$trial" > /dev/null
+          if timeout 120 repo init \
+               -u "https://github.com/LineageOS/android.git" \
+               -b "$los" --depth=1 --no-clone-bundle --git-lfs \
+               >/dev/null 2>&1; then
+            echo "  ✅ repo init succeeded"
+          else
+            echo "  ❌ repo init failed"; popd > /dev/null; rm -rf "$trial"; return 1
+          fi
+          popd > /dev/null
+          rm -rf "$trial"
+
+          return 0
+        }
+
+        # ── Iterate candidates: pick the first that passes all checks ──
+        SELECTED_LOS=""
+        SELECTED_EVOX=""
+
+        for entry in "${CANDIDATES[@]}"; do
+          evox="${entry%%:*}"
+          los="${entry##*:}"
+          if check_candidate "$los" "$evox"; then
+            SELECTED_LOS="$los"
+            SELECTED_EVOX="$evox"
+            break
+          fi
+        done
+
+        if [ -z "$SELECTED_LOS" ]; then
+          echo "::error::No suitable LineageOS + EvoX branch pair found."
+          exit 1
+        fi
+
+        echo ""
+        echo "🎯 Selected branches:"
+        echo "   LineageOS : ${INPUT_LOS:-$SELECTED_LOS}"
+        echo "   EvoX      : ${INPUT_EVOX:-$SELECTED_EVOX}"
+
+        echo "los_branch=${INPUT_LOS:-$SELECTED_LOS}"   >> "$GITHUB_OUTPUT"
+        echo "evox_branch=${INPUT_EVOX:-$SELECTED_EVOX}" >> "$GITHUB_OUTPUT"
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 3.  Repo init + sync                        ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "📂 Initialize repo manifest"
+      run: |
+        LOS_BRANCH="${{ steps.detect.outputs.los_branch }}"
+        mkdir -p "$ANDROID_DIR"
+        cd "$ANDROID_DIR"
+
+        repo init \
+          -u "https://github.com/LineageOS/android.git" \
+          -b "$LOS_BRANCH" \
+          --depth=1        \
+          --no-clone-bundle \
+          --no-tags         \
+          --git-lfs
+
+        echo "✅ Manifest initialized ($LOS_BRANCH)"
+
+    - name: "🧹 Shrink manifest (save disk space)"
+      run: |
+        cd "$ANDROID_DIR"
+        echo "📝 Removing unnecessary Mac/Windows/Test projects from manifest..."
+        cat << 'EOF' > shrink_manifest.py
+        import xml.etree.ElementTree as ET
+        import glob
+
+        for xml_file in glob.glob('.repo/manifests/**/*.xml', recursive=True):
+            try:
+                tree = ET.parse(xml_file)
+                root = tree.getroot()
+                changed = False
+                for project in root.findall('project'):
+                    name = project.get('name', '')
+                    # Remove Mac/Win prebuilts, MIPS, and CTS/VTS test suites to save ~10GB+
+                    if ('darwin' in name or 'windows' in name or 'mips' in name or 
+                        name.startswith('platform/cts') or name.startswith('platform/vts')):
+                        root.remove(project)
+                        changed = True
+                if changed:
+                    tree.write(xml_file)
+                    print(f"Shrunk {xml_file}")
+            except Exception as e:
+                pass
+        EOF
+        python3 shrink_manifest.py
+        rm shrink_manifest.py
+
+    - name: "📋 Create local manifest (room.xml)"
+      run: |
+        EVOX="${{ steps.detect.outputs.evox_branch }}"
+        mkdir -p "$ANDROID_DIR/.repo/local_manifests"
+
+        cat > "$ANDROID_DIR/.repo/local_manifests/room.xml" << XMLEOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <manifest>
+          <remote name="evox-devices"
+                  fetch="https://github.com/Evolution-X-Devices" />
+
+          <project name="device_xiaomi_tissot"
+                   path="device/xiaomi/tissot"
+                   remote="evox-devices"
+                   revision="${EVOX}"
+                   clone-depth="1" />
+
+          <project name="device_xiaomi_msm8953-common"
+                   path="device/xiaomi/msm8953-common"
+                   remote="evox-devices"
+                   revision="${EVOX}"
+                   clone-depth="1" />
+
+          <project name="kernel_xiaomi_tissot"
+                   path="kernel/xiaomi/msm8953"
+                   remote="evox-devices"
+                   revision="${EVOX}"
+                   clone-depth="1" />
+
+          <project name="vendor_xiaomi_tissot"
+                   path="vendor/xiaomi/tissot"
+                   remote="evox-devices"
+                   revision="${EVOX}"
+                   clone-depth="1" />
+
+          <project name="vendor_xiaomi_msm8953-common"
+                   path="vendor/xiaomi/msm8953-common"
+                   remote="evox-devices"
+                   revision="${EVOX}"
+                   clone-depth="1" />
+        </manifest>
+        XMLEOF
+
+        # Strip leading whitespace from YAML indentation
+        sed -i 's/^        //' "$ANDROID_DIR/.repo/local_manifests/room.xml"
+
+        echo "✅ Local manifest created:"
+        cat "$ANDROID_DIR/.repo/local_manifests/room.xml"
+
+    - name: "⬇️ Repo sync (with retries)"
+      run: |
+        cd "$ANDROID_DIR"
+
+        for attempt in 1 2 3; do
+          echo ""
+          echo "📦 Sync attempt ${attempt}/3 …"
+
+          if repo sync \
+               -c                \
+               --no-clone-bundle \
+               --no-tags         \
+               --optimized-fetch \
+               --prune           \
+               --force-sync      \
+               -j"$(nproc)"      \
+               2>&1; then
+            echo "✅ Repo sync succeeded"
+            break
+          fi
+
+          if [ "$attempt" -eq 3 ]; then
+            echo "::error::Repo sync failed after 3 attempts"
+            exit 1
+          fi
+
+          echo "⚠️  Retrying in 30 s …"
+          sleep 30
+        done
+
+        echo ""
+        echo "📊 Disk after sync:"
+        df -h /
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 4.  Patch device tree for pure LineageOS    ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "🔧 Patch EvoX trees → pure LineageOS"
+      run: |
+        cd "$ANDROID_DIR"
+
+        echo "🔧 Patching device trees for a clean LineageOS build …"
+        echo ""
+
+        # ──────────────────────────────────
+        # 4a.  Patch lineage_tissot.mk
+        # ──────────────────────────────────
+        MK="device/xiaomi/tissot/lineage_tissot.mk"
+        if [ -f "$MK" ]; then
+          echo "📝 $MK"
+
+          # Remove Evolution-X specific variables
+          sed -i '/^EVO_BUILD_TYPE/d'               "$MK"
+          sed -i '/^EVO_/d'                         "$MK"
+
+          # Remove GApps flags (vanilla = no GApps)
+          sed -i '/TARGET_USES_PICO_GAPPS/d'        "$MK"
+          sed -i '/TARGET_USES_MINI_GAPPS/d'        "$MK"
+          sed -i '/TARGET_USES_FULL_GAPPS/d'        "$MK"
+          sed -i '/TARGET_INCLUDE_GAPPS/d'          "$MK"
+
+          # Remove EvoX-only feature flags
+          sed -i '/TARGET_INCLUDE_ACCORD/d'         "$MK"
+          sed -i '/TARGET_INCLUDE_MATLOG/d'         "$MK"
+          sed -i '/TARGET_FACE_UNLOCK/d'            "$MK"
+          sed -i '/EXTRA_UDFPS_ANIMATIONS/d'        "$MK"
+
+          echo "  ✅ EvoX variables stripped"
+        fi
+
+        # ──────────────────────────────────
+        # 4b.  Fix vendor/evolution → vendor/lineage
+        # ──────────────────────────────────
+        echo ""
+        echo "📝 Scanning all .mk files for EvoX-specific includes …"
+        PATCHED=0
+
+        while IFS= read -r -d '' f; do
+          if grep -q 'vendor/evolution' "$f" 2>/dev/null; then
+            echo "   Patching: $f"
+            sed -i 's|vendor/evolution/config/common_full_phone\.mk|vendor/lineage/config/common_full_phone.mk|g' "$f"
+            sed -i 's|vendor/evolution/config/common\.mk|vendor/lineage/config/common.mk|g'                       "$f"
+            # Comment out anything else referencing evolution vendor
+            sed -i '/vendor\/evolution/{/^#/!s/^/# EVOX_REMOVED: /}' "$f"
+            PATCHED=$((PATCHED + 1))
+          fi
+        done < <(find device/xiaomi/tissot device/xiaomi/msm8953-common -name "*.mk" -print0 2>/dev/null)
+        echo "  Patched $PATCHED files"
+
+        # ──────────────────────────────────
+        # 4c.  Remove EvoX-only package refs
+        # ──────────────────────────────────
+        echo ""
+        echo "📝 Removing EvoX-only package references …"
+        while IFS= read -r -d '' f; do
+          sed -i '/packages\/apps\/Flavor/d'   "$f" 2>/dev/null || true
+          sed -i '/packages\/apps\/EvoEgg/d'   "$f" 2>/dev/null || true
+          sed -i '/PRODUCT_PACKAGES.*Flavor/d'  "$f" 2>/dev/null || true
+        done < <(find device/xiaomi/tissot device/xiaomi/msm8953-common -name "*.mk" -print0 2>/dev/null)
+
+        # ──────────────────────────────────
+        # 4d.  Strip EVO_ vars from BoardConfig
+        # ──────────────────────────────────
+        while IFS= read -r -d '' f; do
+          if grep -q '^EVO_' "$f" 2>/dev/null; then
+            echo "   Cleaning BoardConfig: $f"
+            sed -i '/^EVO_/d' "$f"
+          fi
+        done < <(find device/xiaomi -name "BoardConfig*.mk" -print0 2>/dev/null)
+
+        echo ""
+        echo "✅ Patching complete. Final lineage_tissot.mk:"
+        echo "────────────────────────────────"
+        cat "$MK" 2>/dev/null || echo "(file not found)"
+        echo "────────────────────────────────"
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 5.  ccache setup & restore                  ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "⚡ Configure ccache"
+      run: |
+        mkdir -p "$CCACHE_DIR"
+
+        ccache -M "$CCACHE_SIZE"
+        ccache -z                     # reset stats
+
+        {
+          echo "USE_CCACHE=1"
+          echo "CCACHE_EXEC=$(which ccache)"
+          echo "CCACHE_COMPRESS=1"
+          echo "CCACHE_COMPRESSLEVEL=1"
+        } >> "$GITHUB_ENV"
+
+        echo "✅ ccache configured — max $CCACHE_SIZE, compression on"
+
+    - name: "📥 Restore ccache from GitHub cache"
+      if: inputs.force_clean != true
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ steps.detect.outputs.los_branch }}-${{ github.run_number }}
+        restore-keys: |
+          ccache-${{ steps.detect.outputs.los_branch }}-
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 6.  BUILD                                    ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "🏗️ Build LineageOS (with watchdog)"
+      id: build
+      run: |
+        cd "$ANDROID_DIR"
+
+        echo "📊 Pre-build disk:"
+        df -h /
+        echo ""
+
+        # ── Source the build environment ──
+        source build/envsetup.sh
+
+        # ── lunch: try several format variants ──
+        echo "🍽️  Setting up build target …"
+        LUNCH_OK=false
+
+        for target in \
+          "lineage_tissot-userdebug"                 \
+          "lineage_tissot-trunk_staging-userdebug"   \
+          "lineage_tissot-ap3a-userdebug"            \
+        ; do
+          echo "   Trying: lunch $target"
+          if lunch "$target" 2>&1; then
+            echo "   ✅ lunch succeeded with: $target"
+            LUNCH_OK=true
+            break
+          fi
+        done
+
+        if [ "$LUNCH_OK" = "false" ]; then
+          echo "::error::lunch failed for all known target formats!"
+          echo ""
+          echo "── Debug: PRODUCT_NAME in device tree ──"
+          grep -rh 'PRODUCT_NAME' device/xiaomi/tissot/*.mk 2>/dev/null || true
+          echo ""
+          echo "── lineage_tissot.mk ──"
+          cat device/xiaomi/tissot/lineage_tissot.mk 2>/dev/null || true
+          exit 1
+        fi
+
+        echo ""
+        echo "🏗️ Starting build …"
+        echo "   Threads : $(nproc --all)"
+        echo "   Watchdog: ${WATCHDOG_SECONDS}s (~5 h 15 min)"
+        echo ""
+
+        BUILD_START=$(date +%s)
+        BUILD_TIMED_OUT=false
+
+        # ── Launch build in background ──
+        make -j"$(nproc --all)" bacon 2>&1 | tee /tmp/build.log &
+        BUILD_PID=$!
+
+        # ── Watchdog loop ──
+        while kill -0 "$BUILD_PID" 2>/dev/null; do
+          JOB_ELAPSED=$(( $(date +%s) - JOB_START_TIME ))
+          BUILD_ELAPSED=$(( $(date +%s) - BUILD_START ))
+          REMAINING=$(( (WATCHDOG_SECONDS - JOB_ELAPSED) / 60 ))
+
+          if [ "$JOB_ELAPSED" -ge "$WATCHDOG_SECONDS" ]; then
+            echo ""
+            echo "⏰ ═══════════════════════════════════════════════"
+            echo "⏰  WATCHDOG: Job time limit reached ($((JOB_ELAPSED/60)) min)"
+            echo "⏰  Stopping build for ccache-based continuation …"
+            echo "⏰ ═══════════════════════════════════════════════"
+
+            kill "$BUILD_PID" 2>/dev/null || true
+            sleep 15
+            kill -9 "$BUILD_PID" 2>/dev/null || true
+            BUILD_TIMED_OUT=true
+            break
+          fi
+
+          # Progress heartbeat every 5 min
+          if [ $(( BUILD_ELAPSED % 300 )) -lt 65 ]; then
+            echo "⏱️  [${BUILD_ELAPSED}s / ~$((BUILD_ELAPSED/60)) min] building … (~${REMAINING} min left for job)"
+          fi
+          sleep 60
+        done
+
+        wait "$BUILD_PID" 2>/dev/null || true
+        BUILD_EXIT=${PIPESTATUS[0]:-$?}
+
+        TOTAL=$(( $(date +%s) - BUILD_START ))
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Duration : $((TOTAL / 60)) min"
+        echo "  Exit code: $BUILD_EXIT"
+        echo "  Timed out: $BUILD_TIMED_OUT"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # ── Determine outcome ──
+        if [ "$BUILD_TIMED_OUT" = "true" ]; then
+          echo "status=timeout" >> "$GITHUB_OUTPUT"
+        elif [ "$BUILD_EXIT" -eq 0 ] && \
+             ls out/target/product/tissot/lineage-*.zip 1>/dev/null 2>&1; then
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "🎉 BUILD SUCCESSFUL!"
+        else
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "❌ Build failed.  Last 80 lines of log:"
+          tail -80 /tmp/build.log
+        fi
+
+        echo ""
+        echo "📊 Post-build disk:"
+        df -h /
+        echo ""
+        echo "📊 ccache statistics:"
+        ccache -s 2>/dev/null || true
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 7.  Save ccache (runs ALWAYS)               ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "📤 Save ccache to GitHub cache"
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ steps.detect.outputs.los_branch }}-${{ github.run_number }}-${{ github.run_attempt }}
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 8.  Collect artifacts & publish Release      ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "📦 Collect build artifacts"
+      id: artifacts
+      if: steps.build.outputs.status == 'success'
+      run: |
+        cd "$ANDROID_DIR"
+        OUT="out/target/product/tissot"
+        DEST="${{ github.workspace }}/artifacts"
+        mkdir -p "$DEST"
+
+        # ── ROM zip ──
+        ROM_ZIP=$(ls -t "$OUT"/lineage-*.zip 2>/dev/null | head -1)
+        if [ -n "$ROM_ZIP" ]; then
+          ROM_NAME=$(basename "$ROM_ZIP")
+          cp "$ROM_ZIP" "$DEST/"
+          sha256sum "$DEST/$ROM_NAME" > "$DEST/${ROM_NAME}.sha256sum"
+          echo "rom_name=$ROM_NAME"         >> "$GITHUB_OUTPUT"
+          echo "✅ ROM : $ROM_NAME ($(du -h "$ROM_ZIP" | cut -f1))"
+        fi
+
+        # ── boot.img ──
+        if [ -f "$OUT/boot.img" ]; then
+          cp "$OUT/boot.img" "$DEST/"
+          echo "✅ boot.img"
+        fi
+
+        # ── recovery.img (may not exist on A/B devices) ──
+        if [ -f "$OUT/recovery.img" ]; then
+          cp "$OUT/recovery.img" "$DEST/"
+          echo "✅ recovery.img"
+        fi
+
+        # ── dtbo.img ──
+        if [ -f "$OUT/dtbo.img" ]; then
+          cp "$OUT/dtbo.img" "$DEST/"
+          echo "✅ dtbo.img"
+        fi
+
+        # ── vendor_boot.img ──
+        if [ -f "$OUT/vendor_boot.img" ]; then
+          cp "$OUT/vendor_boot.img" "$DEST/"
+          echo "✅ vendor_boot.img"
+        fi
+
+        echo ""
+        echo "📦 Artifacts:"
+        ls -lh "$DEST/"
+
+    - name: "📝 Prepare release metadata"
+      id: release_meta
+      if: steps.build.outputs.status == 'success'
+      run: |
+        DATE_TAG=$(date -u +%Y%m%d)
+        DATE_HUMAN=$(date -u +%Y-%m-%d)
+        LOS="${{ steps.detect.outputs.los_branch }}"
+        EVOX="${{ steps.detect.outputs.evox_branch }}"
+        TAG="${LOS}-${DATE_TAG}-r${{ github.run_number }}"
+
+        echo "tag=$TAG"               >> "$GITHUB_OUTPUT"
+        echo "date=$DATE_HUMAN"       >> "$GITHUB_OUTPUT"
+
+        # Write release body (heredoc with dash strips leading tabs)
+        cat > /tmp/release_body.md << 'BODYEOF'
+        ## 🏗️ Automated LineageOS Build — Xiaomi Mi A1 (tissot)
+        BODYEOF
+
+        cat >> /tmp/release_body.md << EOF
+
+        | | |
+        |:---|:---|
+        | **ROM** | LineageOS \`${LOS}\` (Vanilla — no GApps) |
+        | **Device trees** | Evolution-X (\`${EVOX}\`) |
+        | **Target** | \`lineage_tissot-userdebug\` |
+        | **Date** | ${DATE_HUMAN} |
+        | **Workflow run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+        ### 📥 Flash instructions
+        1. Boot into a custom recovery (TWRP / OrangeFox)
+        2. **Wipe** system · data · cache · dalvik
+        3. Flash the \`.zip\` file
+        4. Reboot to system
+
+        ### 🔐 Verify download integrity
+        \`\`\`bash
+        sha256sum -c <filename>.sha256sum
+        \`\`\`
+
+        > ⚠️ **Unofficial automated build — use at your own risk.**
+        EOF
+
+        # Strip leading whitespace from all lines (artifact of YAML indentation)
+        sed -i 's/^        //' /tmp/release_body.md
+
+        echo "✅ Release metadata ready: tag=$TAG"
+
+    - name: "🚀 Create GitHub Release"
+      if: steps.build.outputs.status == 'success'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.release_meta.outputs.tag }}
+        name: "LineageOS ${{ steps.detect.outputs.los_branch }} for tissot — ${{ steps.release_meta.outputs.date }}"
+        body_path: /tmp/release_body.md
+        files: ${{ github.workspace }}/artifacts/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 9.  Continuation logic (on timeout)          ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "🔄 Re-trigger workflow (continuation)"
+      if: steps.build.outputs.status == 'timeout'
+      env:
+        PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+      run: |
+        COUNT="${{ steps.continuation.outputs.count }}"
+        NEXT=$(( COUNT + 1 ))
+
+        echo "⏰ Build timed out — scheduling continuation $NEXT / $MAX_CONTINUATIONS"
+
+        if [ -z "$PAT_TOKEN" ]; then
+          echo "::error::PAT_TOKEN secret is not set!"
+          echo ""
+          echo "To enable build continuation across the 6-hour limit:"
+          echo "  1. Go to https://github.com/settings/tokens?type=beta"
+          echo "  2. Create a Fine-Grained PAT scoped to this repo"
+          echo "  3. Grant permission: Actions → Read & Write"
+          echo "  4. Save it as repository secret PAT_TOKEN"
+          exit 1
+        fi
+
+        # Brief pause so the cache-save step finishes first
+        sleep 30
+
+        HTTP=$(curl -s -o /tmp/retrigger_response.txt -w "%{http_code}" \
+          -X POST \
+          -H "Authorization: token $PAT_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
+          -d '{
+            "ref": "${{ github.ref_name }}",
+            "inputs": {
+              "continuation_count": "'"$NEXT"'",
+              "lineage_branch": "${{ steps.detect.outputs.los_branch }}",
+              "evox_branch": "${{ steps.detect.outputs.evox_branch }}"
+            }
+          }')
+
+        if [ "$HTTP" = "204" ]; then
+          echo "✅ Continuation run #${NEXT} triggered successfully!"
+        else
+          echo "::error::Failed to trigger continuation (HTTP $HTTP)"
+          cat /tmp/retrigger_response.txt
+          exit 1
+        fi
+
+    # ╔═════════════════════════════════════════════╗
+    # ║ 10.  Final status                            ║
+    # ╚═════════════════════════════════════════════╝
+    - name: "❌ Fail on build error"
+      if: steps.build.outputs.status == 'failed'
+      run: |
+        echo "::error::Build failed — check the build log above for details."
+        exit 1
