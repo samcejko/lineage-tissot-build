@@ -392,6 +392,10 @@ jobs:
           echo ""
           echo "📦 Sync attempt ${attempt}/3 …"
 
+          # Run ping loop in background to keep runner alive
+          while true; do echo "ping"; sleep 60; done &
+          PING_PID=$!
+
           if repo sync \
                -c                \
                --no-clone-bundle \
@@ -399,12 +403,14 @@ jobs:
                --optimized-fetch \
                --prune           \
                --force-sync      \
-               -j"$(nproc)"      \
+               -j2               \
                2>&1; then
             echo "✅ Repo sync succeeded"
+            kill $PING_PID
             break
           fi
 
+          kill $PING_PID
           if [ "$attempt" -eq 3 ]; then
             echo "::error::Repo sync failed after 3 attempts"
             exit 1
